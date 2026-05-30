@@ -133,20 +133,21 @@ def process_video(
     Parameters
     ----------
     video_path    : str   path to the uploaded (temp) video file
-    exercise_type : str   'squat' or 'deadlift'
+    exercise_type : str   'squat' or 'deadlift'  (user-selected fallback)
     progress_bar  : Streamlit progress widget
     status_text   : Streamlit empty widget for status messages
 
     Returns
     -------
     dict with keys:
-        frames        – list of annotated BGR numpy frames
-        angle_history – list of angle dicts (one per frame)
-        rep_count     – int
-        form_score    – int (0–100)
-        warnings      – list[str]  unique warning messages
-        good_form     – list[str]  unique positive messages
-        fps           – float
+        frames            – list of annotated BGR numpy frames
+        angle_history     – list of angle dicts (one per frame)
+        rep_count         – int
+        form_score        – int (0–100)
+        warnings          – list[str]  unique warning messages
+        good_form         – list[str]  unique positive messages
+        fps               – float
+        detected_exercise – str | None  auto-classified type
     """
 
     # ── Initialise components ──────────────────────────────────────────
@@ -157,11 +158,11 @@ def process_video(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-    processed_frames: list   = []
-    angle_history:    list   = []
-    all_warnings:     list   = []
-    all_good_form:    list   = []
-    frame_idx:        int    = 0
+    processed_frames: list = []
+    angle_history:    list = []
+    all_warnings:     list = []
+    all_good_form:    list = []
+    frame_idx:        int  = 0
 
     # ── Frame loop ────────────────────────────────────────────────────
     while cap.isOpened():
@@ -171,29 +172,23 @@ def process_video(
 
         frame_idx += 1
 
-        # Progress update
         if total_frames > 0:
             progress_bar.progress(min(frame_idx / total_frames, 1.0))
         status_text.text(f"⚙️  Analysing frame {frame_idx} / {total_frames} …")
 
-        # Keep resolution manageable for speed
         frame = resize_frame(frame, max_width=640)
 
         # ── Pose detection ─────────────────────────────────────────────
-        results   = detector.detect_pose(frame)
-        landmarks = detector.extract_landmarks(results, frame.shape)
-
-        # Draw skeleton regardless of angle availability
-        frame = detector.draw_landmarks(frame, results)
+        mp_results = detector.detect_pose(frame)
+        landmarks  = detector.extract_landmarks(mp_results, frame.shape)
+        frame      = detector.draw_landmarks(frame, mp_results)
 
         if landmarks:
             key_points = detector.get_key_points(landmarks)
-
-            # ── Angle calculation ──────────────────────────────────────
-            angles = calculate_all_angles(key_points)
+            angles     = calculate_all_angles(key_points)
             angle_history.append(angles)
 
-            # ── Biomechanics feedback ──────────────────────────────────
+            # ── Biomechanics feedback (uses user-selected type) ────────
             if exercise_type == "squat":
                 warnings, good_form = analyze_squat(angles, key_points)
             else:
@@ -202,10 +197,13 @@ def process_video(
             all_warnings.extend(warnings)
             all_good_form.extend(good_form)
 
-            # ── Rep counting ───────────────────────────────────────────
-            rep_count, phase = rep_counter.update(key_points)
+            # ── Rep counting — pass knee angle, NOT key_points ─────────
+            # BUG FIX: rep_counter.update() now takes a float (degrees),
+            # not the key_points dict. angles.get("knee") returns None
+            # when landmarks are missing, which the counter handles safely.
+            rep_count, _state = rep_counter.update(angles.get("knee"))
 
-            # ── Angle labels on frame ──────────────────────────────────
+            # ── Angle labels ───────────────────────────────────────────
             if "knee" in angles and "left_knee" in key_points:
                 frame = draw_angle_label(frame, key_points["left_knee"],
                                          angles["knee"],  (0, 255, 150))
@@ -215,7 +213,6 @@ def process_video(
                                          angles["hip"],   (0, 220, 255))
 
             if "spine" in angles and "mid_hip" in angles:
-                # mid_hip is stored inside angles by calculate_all_angles
                 frame = draw_angle_label(frame, angles["mid_hip"],
                                          angles["spine"], (255, 140, 0))
 
@@ -224,35 +221,43 @@ def process_video(
                 k: v for k, v in angles.items()
                 if k in ("knee", "hip", "spine") and isinstance(v, (int, float))
             }
-            frame = draw_info_overlay(frame, rep_count, rep_counter.phase_label,
-                                      exercise_type, display_angles)
+            frame = draw_info_overlay(
+                frame, rep_count, rep_counter.phase_label,
+                exercise_type, display_angles,
+            )
 
-            # ── Warnings banner ────────────────────────────────────────
             if warnings:
                 frame = draw_warnings_on_frame(frame, warnings)
 
         else:
-            # No pose detected — record empty angles so history stays aligned
+            # No pose — keep history aligned
             angle_history.append({})
+            # Still advance the counter with None so debounce clock ticks
+            rep_counter.update(None)
 
         processed_frames.append(frame.copy())
 
     cap.release()
     detector.release()
 
+    # ── Auto-classify exercise from full angle history ─────────────────
+    # Returns 'squat', 'deadlift', or None (falls back to user selection).
+    detected_exercise = PoseDetector.classify_exercise(angle_history)
+
     # ── Aggregate results ──────────────────────────────────────────────
-    unique_warnings  = list(dict.fromkeys(all_warnings))   # deduplicate, keep order
+    unique_warnings  = list(dict.fromkeys(all_warnings))
     unique_good_form = list(dict.fromkeys(all_good_form))
     form_score       = get_form_score(unique_warnings, unique_good_form)
 
     return {
-        "frames":        processed_frames,
-        "angle_history": angle_history,
-        "rep_count":     rep_counter.rep_count,
-        "form_score":    form_score,
-        "warnings":      unique_warnings,
-        "good_form":     unique_good_form,
-        "fps":           fps,
+        "frames":            processed_frames,
+        "angle_history":     angle_history,
+        "rep_count":         rep_counter.rep_count,
+        "form_score":        form_score,
+        "warnings":          unique_warnings,
+        "good_form":         unique_good_form,
+        "fps":               fps,
+        "detected_exercise": detected_exercise,  # NEW — may be None
     }
 
 
@@ -287,6 +292,20 @@ def display_results(results: dict, exercise_type: str):
 
     # ── Metric cards ──────────────────────────────────────────────────
     st.markdown("### 📊 Performance Summary")
+
+    # Auto-classification banner (shown when auto-detect disagrees with user)
+    detected = results.get("detected_exercise")
+    if detected is not None and detected != exercise_type:
+        st.warning(
+            f"🤖 **Auto-detection** classified this video as **{detected.capitalize()}** "
+            f"but you selected **{exercise_type.capitalize()}**. "
+            f"If the feedback looks wrong, re-run with the correct exercise selected."
+        )
+    elif detected is not None:
+        st.info(f"🤖 Auto-detected exercise: **{detected.capitalize()}** ✅")
+    else:
+        st.caption("🤖 Auto-detection: insufficient classifiable frames — using your selection.")
+
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
