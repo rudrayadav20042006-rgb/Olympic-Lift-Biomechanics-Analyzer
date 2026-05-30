@@ -1,4 +1,4 @@
-# 🏋️ Olympic Lift Biomechanics Analyzer
+# Lift Biomechanics Analyzer
 
 > **AI-powered squat & deadlift form analysis using Computer Vision, MediaPipe, and Streamlit.**
 >
